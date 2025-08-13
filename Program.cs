@@ -27,8 +27,11 @@ static class App
             }
 
             Console.WriteLine("Reading archives...");
-            var oldMap = LoadArchive(opts.OldTgz!, opts);
-            var newMap = LoadArchive(opts.NewTgz!, opts);
+            var oldMap = LoadArchive(opts.OldTgz!, opts, out var oldStats);
+            var newMap = LoadArchive(opts.NewTgz!, opts, out var newStats);
+
+            Console.WriteLine($"[INFO] {Path.GetFileName(opts.OldTgz!)} -> files: {oldStats.files}, objects: {oldStats.objects}");
+            Console.WriteLine($"[INFO] {Path.GetFileName(opts.NewTgz!)} -> files: {newStats.files}, objects: {newStats.objects}");
 
             Console.WriteLine("Diffing...");
             var diff = Diff(oldMap, newMap);
@@ -118,7 +121,8 @@ Example:
     }
 
     // ----------------- Archive -> Object Map ----------------
-    private static Dictionary<string, ObjRec> LoadArchive(string tgzPath, Options o)
+    private static Dictionary<string, ObjRec> LoadArchive(
+        string tgzPath, Options o, out (int files, int objects) stats)
     {
         using var fs = File.OpenRead(tgzPath);
         using var gz = new GZipStream(fs, CompressionMode.Decompress, leaveOpen: false);
@@ -128,85 +132,110 @@ Example:
         var sepRegex = BuildSeparatorRegex(o.MultiValueSeparators);
         var ignore = o.Ignore;
 
+        int filesSeen = 0, objectsSeen = 0;
+
         TarEntry? entry;
         while ((entry = tar.GetNextEntry()) is not null)
         {
-            if (entry.EntryType is not TarEntryType.RegularFile) continue;
+            if (entry.EntryType is not TarEntryType.RegularFile and not TarEntryType.V7RegularFile)
+                continue;
+
             var name = entry.Name ?? "";
-            if (!name.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) continue;
+            var lower = name.ToLowerInvariant();
+
+            if (!lower.EndsWith(".json") && !lower.EndsWith(".json.gz"))
+                continue;
 
             using var ms = new MemoryStream();
             entry.DataStream!.CopyTo(ms);
-            var json = Encoding.UTF8.GetString(ms.ToArray());
-            var fileStem = Path.GetFileNameWithoutExtension(name);
+            var payload = ms.ToArray();
 
-            LoadJsonFile(json, fileStem, map, ignore, sepRegex);
+            if (lower.EndsWith(".json.gz"))
+            {
+                using var innerMs = new MemoryStream(payload);
+                using var innerGz = new GZipStream(innerMs, CompressionMode.Decompress);
+                using var outMs = new MemoryStream();
+                innerGz.CopyTo(outMs);
+                payload = outMs.ToArray();
+            }
+
+            var json = Encoding.UTF8.GetString(payload);
+            var fileStem = Path.GetFileNameWithoutExtension(
+                               Path.GetFileNameWithoutExtension(name)); // strip .json.gz
+
+            filesSeen++;
+            objectsSeen += LoadJsonFile(json, fileStem, map, ignore, sepRegex);
         }
 
+        stats = (filesSeen, objectsSeen);
         return map;
     }
 
-    private static void LoadJsonFile(string json, string fileStem,
+    private static int LoadJsonFile(string json, string fileStem,
         Dictionary<string, ObjRec> map, HashSet<string> ignore, Regex sep)
     {
         using var doc = JsonDocument.Parse(json);
+        int added = 0;
 
+        // Try common container shapes
         if (doc.RootElement.ValueKind == JsonValueKind.Array)
         {
             foreach (var el in doc.RootElement.EnumerateArray())
-                AddFromElement(el, fileStem, map, ignore, sep);
-            return;
+                if (AddFromElement(el, fileStem, map, ignore, sep)) added++;
+            return added;
         }
 
         if (doc.RootElement.ValueKind == JsonValueKind.Object)
         {
-            // Common BloodHound shapes
-            if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+            // data / nodes / objects / items / rows / entries
+            foreach (var key in new[] { "data", "nodes", "objects", "items", "rows", "entries" })
             {
-                foreach (var el in data.EnumerateArray())
-                    AddFromElement(el, fileStem, map, ignore, sep);
-                return;
-            }
-            if (doc.RootElement.TryGetProperty("nodes", out var nodes) && nodes.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var el in nodes.EnumerateArray())
-                    AddFromElement(el, fileStem, map, ignore, sep);
-                return;
+                if (doc.RootElement.TryGetProperty(key, out var arr) && arr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var el in arr.EnumerateArray())
+                        if (AddFromElement(el, fileStem, map, ignore, sep)) added++;
+                    return added;
+                }
             }
 
-            // Fallback: treat as single object
-            AddFromElement(doc.RootElement, fileStem, map, ignore, sep);
+            // Fallback single object
+            if (AddFromElement(doc.RootElement, fileStem, map, ignore, sep)) added++;
         }
+
+        return added;
     }
 
-    private static void AddFromElement(JsonElement el, string fileStem,
+    private static bool AddFromElement(JsonElement el, string fileStem,
         Dictionary<string, ObjRec> map, HashSet<string> ignore, Regex sep)
     {
-        // If nested "Properties" object exists, use that as the attribute map
+        // Prefer Properties if present (BloodHound-like)
         JsonElement attrSource = el;
         if (el.TryGetProperty("Properties", out var props) && props.ValueKind == JsonValueKind.Object)
             attrSource = props;
 
-        // Key detection (order matters)
-        string? dn = TryGetString(attrSource, "DistinguishedName")
-                     ?? TryGetString(attrSource, "distinguishedname")
-                     ?? TryGetString(attrSource, "dn")
-                     ?? TryGetString(attrSource, "ObjectIdentifier")
-                     ?? TryGetString(attrSource, "objectid")
-                     ?? TryGetString(attrSource, "Guid")
-                     ?? TryGetString(attrSource, "guid")
-                     ?? TryGetString(attrSource, "Name")
-                     ?? TryGetString(attrSource, "name");
+        // Key detection from BOTH root and attrSource (order matters)
+        string? key =
+            TryGetString(el, "DistinguishedName") ?? TryGetString(attrSource, "DistinguishedName") ??
+            TryGetString(el, "distinguishedname") ?? TryGetString(attrSource, "distinguishedname") ??
+            TryGetString(el, "dn") ?? TryGetString(attrSource, "dn") ??
+            TryGetString(el, "ObjectIdentifier") ?? TryGetString(attrSource, "ObjectIdentifier") ??
+            TryGetString(el, "objectid") ?? TryGetString(attrSource, "objectid") ??
+            TryGetString(el, "Guid") ?? TryGetString(attrSource, "Guid") ??
+            TryGetString(el, "guid") ?? TryGetString(attrSource, "guid") ??
+            TryGetString(el, "Name") ?? TryGetString(attrSource, "Name") ??
+            TryGetString(el, "name") ?? TryGetString(attrSource, "name") ??
+            TryGetString(el, "id") ?? TryGetString(attrSource, "id");
 
-        if (string.IsNullOrWhiteSpace(dn))
-            return;
+        if (string.IsNullOrWhiteSpace(key))
+            return false;
 
-        // If key is too generic (e.g., just "Name"), namespace by file stem to avoid collisions
-        if (!dn.Contains("=", StringComparison.OrdinalIgnoreCase) && !dn.Contains("{") && !dn.Contains("@") && !dn.Contains("-") && !dn.Contains(","))
-            dn = $"{fileStem}:{dn}";
+        // If key is too generic, namespace by file to avoid collisions
+        if (!key.Contains("=") && !key.Contains("{") && !key.Contains("@") && !key.Contains("-") && !key.Contains(","))
+            key = $"{fileStem}:{key}";
 
         var attrs = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
+        // Collect from attrSource
         foreach (var p in attrSource.EnumerateObject())
         {
             if (ignore.Contains(p.Name)) continue;
@@ -215,7 +244,7 @@ Example:
             if (p.NameEquals("DistinguishedName") || p.NameEquals("distinguishedname") || p.NameEquals("dn")) continue;
             if (p.NameEquals("ObjectIdentifier") || p.NameEquals("objectid")) continue;
             if (p.NameEquals("Guid") || p.NameEquals("guid")) continue;
-            if (p.NameEquals("name") || p.NameEquals("Name")) continue;
+            if (p.NameEquals("name") || p.NameEquals("Name") || p.NameEquals("id")) continue;
             if (p.NameEquals("objectClass")) continue;
 
             var values = NormalizeValues(p.Value, sep);
@@ -246,7 +275,8 @@ Example:
         var fp = string.Join("|", attrs.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                                        .Select(kv => $"{kv.Key}={string.Join("||", kv.Value)}"));
 
-        map[dn] = new ObjRec(dn, attrs, fp);
+        map[key] = new ObjRec(key, attrs, fp);
+        return true;
     }
 
     private static string? TryGetString(JsonElement el, string name)
